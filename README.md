@@ -1070,3 +1070,54 @@ async function handleBlob(response) {
 async function handleJson(response) {
     return response.text().then(text => (text && JSON.parse(text)));
 }
+
+package eu.unicredit.dbn.translations.repositories;
+
+import javax.persistence.EntityManager;
+import javax.persistence.PersistenceContext;
+
+import org.hibernate.Session;
+import org.springframework.transaction.annotation.Transactional;
+
+public class ClientIdentifierRepositoryCustomImpl
+	implements ClientIdentifierRepositoryCustom {
+
+	@PersistenceContext
+	EntityManager entityManager;
+
+	@Transactional
+	@Override
+	public void setClientIdentifier(String clientIdentifier) {
+		Session session = entityManager.unwrap(Session.class);
+		session.doWork(connection -> connection.setClientInfo("OCSID.CLIENTID", clientIdentifier));
+	}
+}
+                    
+create or replace trigger trg_audit_translations
+    after update or delete or insert
+    on TRANSLATIONS
+    for each row
+declare
+    op varchar2(1) := null;
+    userid varchar2(255) := null;
+begin
+    if (inserting or updating) then
+        op := 'C';
+        if updating then
+            op := 'U';
+        end if;
+        insert into TRANSLATIONS_AUDIT
+            (id, tenant, component, key, language, text, description, modified_by, modified_date, op)
+            values
+            (:NEW.id, :NEW.tenant, :NEW.component, :NEW.key, :NEW.language, :NEW.text, :NEW.description, :NEW.modified_by, :NEW.modified_date, op);
+    elsif deleting then
+        op := 'D';
+        userid := nvl(sys_context('userenv', 'client_identifier'), user);
+        insert into TRANSLATIONS_AUDIT
+            (id, tenant, component, key, language, text, description, modified_by, modified_date, op)
+            values
+            (:OLD.id, :OLD.tenant, :OLD.component, :OLD.key, :OLD.language, :OLD.text, :OLD.description, userid, systimestamp, op);
+    end if;
+end;
+
+
