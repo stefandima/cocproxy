@@ -1,0 +1,524 @@
+package eu.unicredit.dbn.translations.services;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.gson.Gson;
+import com.querydsl.core.types.dsl.BooleanExpression;
+import com.querydsl.core.types.dsl.StringPath;
+import eu.unicredit.dbn.translations.entities.TenantComponent;
+import eu.unicredit.dbn.translations.entities.QTranslationEntity;
+import eu.unicredit.dbn.translations.entities.TranslationEntity;
+import eu.unicredit.dbn.translations.repositories.TranslationEntityRepositoryCustom;
+import eu.unicredit.dbn.translations.services.dto.TenantDto;
+import eu.unicredit.dbn.translations.xlsx.XLSXSaxProcessor;
+import lombok.NonNull;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.poi.openxml4j.exceptions.NotOfficeXmlFileException;
+import org.apache.poi.openxml4j.exceptions.OpenXML4JException;
+import org.apache.poi.openxml4j.opc.OPCPackage;
+import org.apache.poi.ss.usermodel.Row;
+import org.apache.poi.ss.usermodel.Sheet;
+import org.apache.poi.xssf.streaming.SXSSFWorkbook;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.data.domain.AuditorAware;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.BatchPreparedStatementSetter;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.multipart.MultipartFile;
+import org.xml.sax.SAXException;
+
+import java.io.IOException;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import static eu.unicredit.dbn.translations.entities.TranslationEntity.TRANSLATIONS_SEQ;
+import static eu.unicredit.dbn.translations.entities.TranslationEntity.TRANSLATIONS_TABLE;
+
+@Service
+public class TranslationsService {
+
+    private final TranslationEntityRepositoryCustom translationsRepository;
+    private final AuditorAware<String> auditorProvider;
+    private final JdbcTemplate jdbcTemplate;
+    private final boolean allowUpdatesWithImport;
+    private final String sqlMerge;
+    private static final Logger logger = LoggerFactory.getLogger(TranslationsService.class);
+
+    private static final String INVALID_LANGUAGE_REJECT_REASON = "invalid language";
+    private static final String INVALID_CHANNEL_REJECT_REASON = "invalid channel";
+
+    public TranslationsService(TranslationEntityRepositoryCustom translationsRepository, AuditorAware<String> auditorProvider, JdbcTemplate jdbcTemplate, @Qualifier("allowUpdatesWithImport") Boolean allowUpdatesWithImport) {
+        this.translationsRepository = translationsRepository;
+        this.auditorProvider = auditorProvider;
+        this.jdbcTemplate = jdbcTemplate;
+        this.allowUpdatesWithImport = allowUpdatesWithImport;
+        this.sqlMerge = allowUpdatesWithImport ? SQL_MERGE_FULL : SQL_MERGE_INSERTONLY;
+        logger.info("Initialized with allowUpdatesWithImport={}, sqlMerge={}", this.allowUpdatesWithImport, sqlMerge);
+    }
+
+    public TranslationEntity saveTranslation(TranslationEntity translation) {
+        return translationsRepository.save(translation);
+    }
+
+    public TranslationEntity createTranslation(TranslationEntity translation) {
+        return translationsRepository.persist(translation);
+    }
+
+    public void deleteTranslation(Long id) {
+        translationsRepository.setClientIdentifier(auditorProvider.getCurrentAuditor().get());
+        translationsRepository.deleteById(id);
+    }
+
+    public Map exportTranslations(List<TranslationEntity> translationEntityList) {
+        Map<String, Object> exportDocument = new HashMap<>();
+        String json = new Gson().toJson(translationEntityList);
+        exportDocument.put("translations", json.getBytes());
+        return exportDocument;
+    }
+
+    public ResponseEntity<?> importTranslationsFromJson(MultipartFile file) {
+        String fileContent;
+        List<TranslationEntity> importedTranslations;
+        try {
+            fileContent = new String(file.getBytes());
+            importedTranslations = new ObjectMapper().readValue(fileContent, new TypeReference<List<TranslationEntity>>() {
+            });
+        } catch (Exception e) {
+            logger.error("Import json error", e);
+            return new ResponseEntity(new ArrayList<>(), HttpStatus.UNSUPPORTED_MEDIA_TYPE);
+        }
+        if (validateList(importedTranslations).is4xxClientError())
+            return new ResponseEntity(new ArrayList<>(), HttpStatus.UNSUPPORTED_MEDIA_TYPE);
+        List<TranslationEntity> duplicates = insertAll(importedTranslations)
+            .collect(Collectors.toList());
+
+        if (duplicates.isEmpty())
+            return ResponseEntity.ok(duplicates);
+        else
+            return ResponseEntity.ok(exportTranslations(duplicates));
+    }
+
+    static final List<String> XLSHeaders = Arrays.asList("tenant", "component", "key", "language", "channel", "text", "description");
+    public SXSSFWorkbook importTranslationsFromXlsx(MultipartFile file, @NonNull String validTenant) throws IOException {
+
+        SXSSFWorkbookBuilder duplicatesBuilder = new SXSSFWorkbookBuilder(true);
+        // cache reject status
+        String invalidTenant = "invalid tenant <> " + validTenant;
+
+        Set<String> channelSet = TenantDto.ALL_CHANNELS.stream()
+                .map(TenantDto.Channel::getValue)
+                .collect(Collectors.toSet());
+        Set<String> languageSet = Arrays.stream(TenantDto.Language.values())
+                .map(TenantDto.Language::getValue)
+                .collect(Collectors.toSet());
+
+        try {
+            XLSXSaxProcessor xlsxSaxProcessor = new XLSXSaxProcessor(OPCPackage.open(file.getInputStream()));
+
+            final ArrayList<TranslationEntity> batch = new ArrayList<>(BATCH_SIZE);
+            final TranslationInsertBatchPreparedStatementSetter batchPreparedStatementSetter = new TranslationInsertBatchPreparedStatementSetter(auditorProvider.getCurrentAuditor().get());
+
+            final HashMap<String, Integer> headerReferences = new HashMap<>();
+            AtomicInteger currentRow = new AtomicInteger(-1);
+
+            xlsxSaxProcessor.process(row -> {
+
+                // flush current batch
+                if ((row == null && batch.size() > 0)// end of processing
+                    || batch.size() >= BATCH_SIZE) {
+
+                    logger.info("Batch size={} current row={}", batch.size(), currentRow.get());
+                    batchPreparedStatementSetter.reset(batch);
+                    int[] rowsUpdated = jdbcTemplate.batchUpdate(sqlMerge, batchPreparedStatementSetter);
+
+                    for (int i = 0; i < rowsUpdated.length; i++) {
+                        TranslationEntity t = batch.get(i);
+                        logger.debug("rowUpdated {} for {}", rowsUpdated[i], t);
+                        if (rowsUpdated[i] == 0) {
+                            logger.warn("{} duplicate {}", allowUpdatesWithImport ?"Not updated" : "Failed insert", t);
+                            if (!allowUpdatesWithImport) {
+                                duplicatesBuilder.safeAppend(t, "duplicate");
+                            }
+                        }
+                    }
+                    batch.clear();
+                }
+
+                if (row == null) { // end of processing
+                    return;
+                }
+
+                // header
+                if (currentRow.getAndIncrement() == -1) {
+                    if (row.getRowNumber() != 0) {
+                        throw new IllegalArgumentException(String.format("Import file doesn't have expected headers on first line %s", XLSHeaders));
+                    }
+                    for (int i = 0, n = row.getValues().size(); i < n; i++) {
+                        String header = row.getValues().get(i);
+                        if (header != null) {
+                            header = header.toLowerCase();
+                        }
+                        headerReferences.put(header, i);
+                    }
+                    if (headerReferences.size() < 7 || !headerReferences.keySet().containsAll(XLSHeaders)) {
+                        throw new IllegalArgumentException("import file does not have all the required columns");
+                    }
+                    return;
+                }
+
+                // row
+                ArrayList<String> values = row.getValues();
+                String tenant = getColumnValue("tenant", headerReferences, values);
+                String component = getColumnValue("component", headerReferences, values);
+                String key = getColumnValue("key", headerReferences, values);
+                String language = getColumnValue("language", headerReferences, values);
+                String channel = getColumnValue("channel", headerReferences, values);
+                String text = getColumnValue("text", headerReferences, values);
+                String description = getColumnValue("description", headerReferences, values);
+
+                if (StringUtils.isBlank(tenant) && StringUtils.isBlank(component) && StringUtils.isBlank(key) && StringUtils.isBlank(language) && StringUtils.isBlank(channel) && StringUtils.isBlank(text) && StringUtils.isBlank(description)) {
+                    return;
+                }
+
+                if (StringUtils.isBlank(tenant) || StringUtils.isBlank(component) || StringUtils.isBlank(key) || StringUtils.isBlank(language) || StringUtils.isBlank(channel)) {
+                    logger.warn("Ignored as all the records must have the [tenant: {}, component: {}, key: {}, language: {}, channel: {}] fields filled: ", tenant, component, key, language, channel);
+                    return;
+                }
+
+                tenant = StringUtils.trimToNull(tenant);
+                component = StringUtils.trimToNull(component);
+                key = StringUtils.trimToNull(key);
+                language = StringUtils.trimToNull(language);
+                channel = StringUtils.trimToNull(channel);
+
+                String rejectReason = "";
+                if (!tenant.equalsIgnoreCase(validTenant)) {
+                    logger.warn("Ignored record [tenant: {}, component: {}, key: {}, language: {}, channel: {}] as tenant not in [{}]", tenant, component, key, language, channel, validTenant);
+                    rejectReason += StringUtils.isEmpty(rejectReason) ? invalidTenant : "; " + invalidTenant;
+                }
+
+                if (!languageSet.contains(language)) {
+                    logger.warn("Ignored record [tenant: {}, component: {}, key: {}, language: {}, channel: {}] as language not in {}", tenant, component, key, language, channel, languageSet);
+                    rejectReason += StringUtils.isEmpty(rejectReason) ? INVALID_LANGUAGE_REJECT_REASON : "; " + INVALID_LANGUAGE_REJECT_REASON;
+                }
+
+                if (!channelSet.contains(channel)) {
+                    logger.warn("Ignored record [tenant: {}, component: {}, key: {}, language: {}, channel: {}] as channel not in {}", tenant, component, key, language, channel, channelSet);
+                    rejectReason += StringUtils.isEmpty(rejectReason) ? INVALID_CHANNEL_REJECT_REASON : "; " + INVALID_CHANNEL_REJECT_REASON;
+                }
+
+                if (!StringUtils.isEmpty(rejectReason)) {
+                    duplicatesBuilder.safeAppend(tenant, component, key, language, channel, text, description, rejectReason);
+                    return;
+                }
+
+                TranslationEntity dto = new TranslationEntity();
+                dto.setTenant(tenant);
+                dto.setComponent(component);
+                dto.setKey(key);
+                dto.setLanguage(language);
+                dto.setChannel(channel);
+                dto.setText(text);
+                dto.setDescription(description);
+
+                batch.add(dto);
+            });
+
+        } catch (NotOfficeXmlFileException | OpenXML4JException | SAXException e) {
+            logger.error("Import file error", e);
+            throw new IllegalArgumentException("Input is not valid office xml file.");
+        }
+
+        return duplicatesBuilder.build();
+    }
+
+    private String getColumnValue(String columnName, HashMap<String, Integer> columns, ArrayList<String> columnValues) {
+        Integer index = columns.get(columnName);
+        return index != null && index < columnValues.size() ? columnValues.get(index) : null;
+    }
+
+    public HttpStatus validateList(List<TranslationEntity> translations) {
+        for (TranslationEntity t : translations)
+            if (t.getTenant() == null || t.getComponent() == null || t.getKey() == null || t.getLanguage() == null || t.getChannel() == null)
+                return HttpStatus.BAD_REQUEST;
+        return HttpStatus.ACCEPTED;
+    }
+
+    /** returns duplicates: translations for which DataIntegrityViolationException was thrown during insert */
+    @Transactional
+    public Stream<TranslationEntity> insertAll(List<TranslationEntity> importedTranslations) {
+        int[] rowsUpdated = jdbcTemplate.batchUpdate(sqlMerge, new BatchPreparedStatementSetter() {
+
+            @Override
+            public void setValues(PreparedStatement ps, int i) throws SQLException {
+                TranslationEntity translationEntity = importedTranslations.get(i);
+                ps.setString(1, translationEntity.getTenant());
+                ps.setString(2, translationEntity.getComponent());
+                ps.setString(3, translationEntity.getKey());
+                ps.setString(4, translationEntity.getLanguage());
+                ps.setString(5, translationEntity.getChannel());
+                ps.setString(6, translationEntity.getText());
+                ps.setString(7, translationEntity.getDescription());
+                ps.setString(8, auditorProvider.getCurrentAuditor().get());
+            }
+
+            @Override
+            public int getBatchSize() {
+                return importedTranslations.size();
+            }
+        });
+        ArrayList<TranslationEntity> duplicates = new ArrayList<>();
+        for (int i = 0; i < rowsUpdated.length; i++) {
+            if (rowsUpdated[i] == 0) {
+                TranslationEntity translationEntity = importedTranslations.get(i);
+                logger.warn("Failed inserting duplicate translation {}", translationEntity);
+                duplicates.add(translationEntity);
+            }
+        }
+        return duplicates.stream();
+    }
+
+    public Page<TranslationEntity> searchPaginatedTenantTranslations(String text, Pageable pageable) {
+        QTranslationEntity translationEntity = QTranslationEntity.translationEntity;
+        return translationsRepository.findAll(
+                translationEntity.tenant.containsIgnoreCase(text)
+                        .or(translationEntity.component.containsIgnoreCase(text))
+                        .or(translationEntity.key.containsIgnoreCase(text))
+                        .or(translationEntity.language.containsIgnoreCase(text))
+                        .or(translationEntity.channel.containsIgnoreCase(text))
+                        .or(translationEntity.text.containsIgnoreCase(text))
+                        .or(translationEntity.description.containsIgnoreCase(text))
+                ,pageable
+        );
+    }
+
+    public Page<TranslationEntity> searchPaginatedTenantTranslations(String tenant, String text, Pageable pageable) {
+        return translationsRepository.findAll(createPredicate(tenant, text), pageable);
+    }
+
+    public SXSSFWorkbook searchPaginatedTenantTranslationsAsXls(String tenant, String text, Pageable pageable) throws IOException {
+        SXSSFWorkbookBuilder workbookBuilder = new SXSSFWorkbookBuilder(false);
+        workbookBuilder.append(translationsRepository.findAll(createPredicate(tenant, text), pageable).get());
+        return workbookBuilder.build();
+    }
+
+    private BooleanExpression createPredicate(String tenant, String searchText) {
+        if (StringUtils.isBlank(tenant)) {
+            throw new IllegalArgumentException("Tenant is missing!");
+        }
+        QTranslationEntity translationEntity = QTranslationEntity.translationEntity;
+        return translationEntity.tenant.equalsIgnoreCase(tenant)
+                .and(translationEntity.component.containsIgnoreCase(searchText)
+                .or(translationEntity.key.containsIgnoreCase(searchText))
+                .or(translationEntity.language.containsIgnoreCase(searchText))
+                .or(translationEntity.channel.containsIgnoreCase(searchText))
+                .or(translationEntity.text.containsIgnoreCase(searchText))
+                .or(translationEntity.description.containsIgnoreCase(searchText)));
+    }
+
+    /** lenient = true: use 'contains' instead of 'equals" for comparisons. */
+    private BooleanExpression createPredicate(String tenant, MultiValueMap<String, String> filters, boolean lenient) {
+        if (StringUtils.isBlank(tenant)) {
+            throw new IllegalArgumentException("Tenant is missing!");
+        }
+        QTranslationEntity translationEntity = QTranslationEntity.translationEntity;
+        final BooleanExpression[] filtersSpecs = new BooleanExpression[]{translationEntity.tenant.equalsIgnoreCase(tenant)};
+        Optional.ofNullable(filters.get("component")).ifPresent(strings -> filtersSpecs[0] = filtersSpecs[0].and(stringCompare(translationEntity.component, strings, lenient)));
+        Optional.ofNullable(filters.get("key")).ifPresent(strings -> filtersSpecs[0] = filtersSpecs[0].and(stringCompare(translationEntity.key, strings, lenient)));
+        Optional.ofNullable(filters.get("language")).ifPresent(strings -> filtersSpecs[0] = filtersSpecs[0].and(stringCompare(translationEntity.language, strings, lenient)));
+        Optional.ofNullable(filters.get("channel")).ifPresent(strings -> filtersSpecs[0] = filtersSpecs[0].and(stringCompare(translationEntity.channel, strings, lenient)));
+        Optional.ofNullable(filters.get("text")).ifPresent(strings -> filtersSpecs[0] = filtersSpecs[0].and(stringCompare(translationEntity.text, strings, lenient)));
+        Optional.ofNullable(filters.get("description")).ifPresent(strings -> filtersSpecs[0] = filtersSpecs[0].and(stringCompare(translationEntity.description, strings, lenient)));
+        logger.info("TranslationsService.createPredicate {}", filtersSpecs[0]);
+        return filtersSpecs[0];
+    }
+
+    private BooleanExpression stringCompare(StringPath stringPath, List<String> strings, boolean lenient) {
+        BooleanExpression booleanExpression = null;
+        for (String s : strings) {
+            booleanExpression = stringCompare(stringPath, s, lenient).or(booleanExpression);
+        }
+        return booleanExpression;
+    }
+
+    private BooleanExpression stringCompare(StringPath stringPath, String s, boolean lenient) {
+        return lenient ? stringPath.containsIgnoreCase(s) : stringPath.equalsIgnoreCase(s);
+    }
+
+    /** lenient = true: use 'contains' instead of 'equals" for comparisons. */
+    public Page<TranslationEntity> getPaginatedTenantTranslations(String tenant, MultiValueMap<String, String> filters, boolean lenient, Pageable pageable) {
+        BooleanExpression filtersPredicate = createPredicate(tenant, filters, lenient);
+        return translationsRepository.findAll(filtersPredicate, pageable);
+    }
+
+    public SXSSFWorkbook getPaginatedTenantTranslationsAsXls(String tenant, MultiValueMap<String, String> filters, boolean lenient, Pageable pageable) throws IOException {
+        BooleanExpression filtersPredicate = createPredicate(tenant, filters, lenient);
+        SXSSFWorkbookBuilder workbookBuilder = new SXSSFWorkbookBuilder(false);
+        workbookBuilder.append(translationsRepository.findAll(filtersPredicate, pageable).get());
+        return workbookBuilder.build();
+    }
+
+    public List<TenantComponent> getTenantComponents() {
+        return translationsRepository.findDistinctComponents();
+    }
+
+    static public final String SQL_MERGE_INSERTONLY = String.format(
+        "MERGE INTO %s u " +
+            "USING (SELECT ? AS tenant, ? as component, ? AS key, ? as language, ? as channel, ? as text, ? as description, ? as modified_by " +
+            "       FROM DUAL) s " +
+            "ON (lower(s.tenant) = lower(u.tenant) " +
+            "    and lower(s.component) = lower(u.component) " +
+            "    and s.key = u.key " +
+            "    and lower(s.language) = lower(u.language) " +
+            "    and lower(s.channel) = lower(u.channel) " +
+            "    ) " +
+            "WHEN NOT MATCHED " +
+            "    THEN " +
+            "    INSERT (id, tenant, component, key, language, channel, text, description, modified_date, modified_by) " +
+            "    VALUES (%s.nextval, s.tenant, s.component, s.key, s.language, s.channel, s.text, s.description, systimestamp, s.modified_by)",
+        TRANSLATIONS_TABLE, TRANSLATIONS_SEQ
+    );
+    static public final String SQL_MERGE_FULL = String.format(
+        "MERGE INTO %s u " +
+            "USING (SELECT ? AS tenant, ? as component, ? AS key, ? as language, ? as channel, ? as text, ? as description, ? as modified_by " +
+            "       FROM DUAL) s " +
+            "ON (lower(s.tenant) = lower(u.tenant) " +
+            "    and lower(s.component) = lower(u.component) " +
+            "    and s.key = u.key " +
+            "    and lower(s.language) = lower(u.language) " +
+            "    and lower(s.channel) = lower(u.channel) " +
+            "    ) " +
+            "WHEN MATCHED THEN " +
+            "    UPDATE SET " +
+            "        u.text = s.text, " +
+            "        u.description = s.description, " +
+            "        u.modified_by = s.modified_by, " +
+            "        u.modified_date = systimestamp " +
+            "    WHERE " +
+            "          decode(s.text, u.text, 1, 0) = 0 " +
+            "       or decode(s.description, u.description, 1, 0) = 0 " +
+            "WHEN NOT MATCHED THEN " +
+            "    INSERT (id, tenant, component, key, language, channel, text, description, modified_date, modified_by) " +
+            "    VALUES (%s.nextval, s.tenant, s.component, s.key, s.language, s.channel, s.text, s.description, systimestamp, s.modified_by)",
+        TRANSLATIONS_TABLE, TRANSLATIONS_SEQ
+    );
+
+    public static final int BATCH_SIZE = 100;
+    static public class TranslationInsertBatchPreparedStatementSetter
+        implements BatchPreparedStatementSetter {
+
+        List<TranslationEntity> translations = new ArrayList<>(BATCH_SIZE);
+        String auditor;
+
+        public TranslationInsertBatchPreparedStatementSetter(String auditor) {
+            this.auditor = auditor;
+        }
+
+        public void reset(List<TranslationEntity> translations) {
+            this.translations = translations;
+        }
+
+        @Override
+        public void setValues(PreparedStatement ps, int i) throws SQLException {
+            TranslationEntity translationEntity = translations.get(i);
+            ps.setString(1, translationEntity.getTenant());
+            ps.setString(2, translationEntity.getComponent());
+            ps.setString(3, translationEntity.getKey());
+            ps.setString(4, translationEntity.getLanguage());
+            ps.setString(5, translationEntity.getChannel());
+            ps.setString(6, translationEntity.getText());
+            ps.setString(7, translationEntity.getDescription());
+            ps.setString(8, auditor);
+        }
+
+        @Override
+        public int getBatchSize() {
+            return translations.size();
+        }
+    }
+
+    static public class SXSSFWorkbookBuilder {
+        int rowCount;
+        SXSSFWorkbook workbook;
+        Sheet sheet;
+        boolean withStatus;
+
+        SXSSFWorkbookBuilder(boolean withStatus) {
+            this.withStatus = withStatus;
+        }
+
+        private void ensureInit() {
+            if (sheet == null) {
+                workbook = new SXSSFWorkbook(1000);
+                sheet = workbook.createSheet("Translations");
+                Row header = sheet.createRow(rowCount);
+                header.createCell(0).setCellValue("Tenant");
+                header.createCell(1).setCellValue("Component");
+                header.createCell(2).setCellValue("Key");
+                header.createCell(3).setCellValue("Language");
+                header.createCell(4).setCellValue("Channel");
+                header.createCell(5).setCellValue("Text");
+                header.createCell(6).setCellValue("Description");
+                if (withStatus) {
+                    header.createCell(7).setCellValue("Reject reason");
+                }
+            }
+        }
+
+        private void append(TranslationEntity translation, String status) {
+            this.append(translation.getTenant(), translation.getComponent(), translation.getKey(), translation.getLanguage(), translation.getChannel(), translation.getText(), translation.getDescription(), status);
+        }
+
+        private void append(String tenant, String component, String key, String language, String channel, String text, String description, String status) {
+            Row row  = sheet.createRow(++rowCount); // TODO
+            row.createCell(0).setCellValue(tenant);
+            row.createCell(1).setCellValue(component);
+            row.createCell(2).setCellValue(key);
+            row.createCell(3).setCellValue(language);
+            row.createCell(4).setCellValue(channel);
+            row.createCell(5).setCellValue(text);
+            row.createCell(6).setCellValue(description);
+            if (withStatus) {
+                row.createCell(7).setCellValue(status);
+            }
+        }
+
+        final void safeAppend(TranslationEntity translation) {
+            ensureInit();
+            append(translation, null);
+        }
+
+        final void safeAppend(TranslationEntity translation, String status) {
+            ensureInit();
+            append(translation, status);
+        }
+
+        final void safeAppend(String tenant, String component, String key, String language, String channel, String text, String description, String status) {
+            ensureInit();
+            append(tenant, component, key, language, channel, text, description, status);
+        }
+
+        final void append(Stream<TranslationEntity> translations) {
+            try(Stream<TranslationEntity> stream = translations) {
+                stream.forEach(this::safeAppend);
+            }
+        }
+
+        SXSSFWorkbook build() {
+            return workbook;
+        }
+    }
+}
