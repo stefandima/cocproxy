@@ -1,0 +1,195 @@
+package eu.unicredit.dbn.translations.xlsx;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.PrintStream;
+import java.util.ArrayList;
+import java.util.function.Consumer;
+
+import javax.xml.parsers.ParserConfigurationException;
+
+import org.apache.poi.openxml4j.exceptions.OpenXML4JException;
+import org.apache.poi.openxml4j.opc.OPCPackage;
+import org.apache.poi.openxml4j.opc.PackageAccess;
+import org.apache.poi.ss.usermodel.DataFormatter;
+import org.apache.poi.ss.util.CellAddress;
+import org.apache.poi.ss.util.CellReference;
+import org.apache.poi.util.XMLHelper;
+import org.apache.poi.xssf.eventusermodel.ReadOnlySharedStringsTable;
+import org.apache.poi.xssf.eventusermodel.XSSFReader;
+import org.apache.poi.xssf.eventusermodel.XSSFSheetXMLHandler;
+import org.apache.poi.xssf.eventusermodel.XSSFSheetXMLHandler.SheetContentsHandler;
+import org.apache.poi.xssf.model.SharedStrings;
+import org.apache.poi.xssf.model.Styles;
+import org.apache.poi.xssf.model.StylesTable;
+import org.apache.poi.xssf.usermodel.XSSFComment;
+import org.xml.sax.ContentHandler;
+import org.xml.sax.InputSource;
+import org.xml.sax.SAXException;
+import org.xml.sax.XMLReader;
+
+import lombok.Data;
+
+@SuppressWarnings({"java:S106", "java:S4823", "java:S1192"})
+public class XLSXSaxProcessor {
+	private final OPCPackage xlsxPackage;
+
+	/**
+	 * Creates a new XLSX SAX processor
+	 *
+	 * @param pkg        The XLSX package to process
+	 */
+	public XLSXSaxProcessor(OPCPackage pkg) {
+		this.xlsxPackage = pkg;
+	}
+
+	public static void main(String[] args) throws Exception {
+		if (args.length < 1) {
+			System.err.println("Use:");
+			System.err.println("  XLSX2CSV <xlsx file> [min columns]");
+			return;
+		}
+
+		File xlsxFile = new File(args[0]);
+		if (!xlsxFile.exists()) {
+			System.err.println("Not found or not a file: " + xlsxFile.getPath());
+			return;
+		}
+
+		// The package open is instantaneous, as it should be.
+		try (OPCPackage p = OPCPackage.open(xlsxFile.getPath(), PackageAccess.READ)) {
+			XLSXSaxProcessor xlsxSaxProcessor = new XLSXSaxProcessor(p);
+			//xlsxProcessor.process(new SheetToCSV(System.out, 2));
+			xlsxSaxProcessor.process(new SheetToRowConsumer(row -> System.out.println(row.toString())));
+		}
+	}
+
+	/**
+	 * Parses and shows the content of one sheet
+	 * using the specified styles and shared-strings tables.
+	 *
+	 * @param styles           The table of styles that may be referenced by cells in the sheet
+	 * @param strings          The table of strings that may be referenced by cells in the sheet
+	 * @param sheetInputStream The stream to read the sheet-data from.
+	 * @throws java.io.IOException An IO exception from the parser,
+	 *                             possibly from a byte stream or character stream
+	 *                             supplied by the application.
+	 * @throws SAXException        if parsing the XML data fails.
+	 */
+	public void processSheet(Styles styles, SharedStrings strings, SheetContentsHandler sheetHandler,	InputStream sheetInputStream) throws IOException, SAXException {
+		DataFormatter formatter = new DataFormatter();
+		InputSource sheetSource = new InputSource(sheetInputStream);
+		try {
+			XMLReader sheetParser = XMLHelper.newXMLReader();
+			// @see https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html
+			sheetParser.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+			// This may not be strictly required as DTDs shouldn't be allowed at all, per previous line.
+			sheetParser.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
+			sheetParser.setFeature("http://xml.org/sax/features/external-general-entities", false);
+			sheetParser.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+			ContentHandler handler = new XSSFSheetXMLHandler(styles, null, strings, sheetHandler, formatter, false);
+			sheetParser.setContentHandler(handler);
+			sheetParser.parse(sheetSource);
+		} catch (ParserConfigurationException e) {
+			throw new RuntimeException("SAX parser appears to be broken - " + e.getMessage());
+		}
+	}
+
+	public void process(Consumer<SimpleRow> rowConsumer) throws IOException, OpenXML4JException, SAXException {
+		process(new SheetToRowConsumer(rowConsumer));
+	}
+
+	/**
+	 * Initiates the processing of the XLS workbook file.
+	 *
+	 * @throws IOException  If reading the data from the package fails.
+	 * @throws SAXException if parsing the XML data fails.
+	 */
+	public void process(XSSFSheetXMLHandler.SheetContentsHandler sheetContentsHandler) throws IOException, OpenXML4JException, SAXException {
+
+		ReadOnlySharedStringsTable strings = new ReadOnlySharedStringsTable(this.xlsxPackage);
+
+		XSSFReader xssfReader = new XSSFReader(this.xlsxPackage);
+
+		StylesTable styles = xssfReader.getStylesTable();
+
+		XSSFReader.SheetIterator iter = (XSSFReader.SheetIterator) xssfReader.getSheetsData();
+//		int index = 0;
+		while (iter.hasNext()) {
+			try (InputStream stream = iter.next()) {
+//				String sheetName = iter.getSheetName();
+//				this.output.println();
+//				this.output.println(sheetName + " [index=" + index + "]:");
+				//processSheet(styles, strings, new SheetToCSV(), stream);
+				processSheet(styles, strings, sheetContentsHandler, stream);
+			}
+//			++index;
+		}
+	}
+
+	@Data
+	static public class SimpleRow {
+		int rowNumber;
+		final ArrayList<String> values = new ArrayList<>();
+
+		void resetValues() {
+			values.clear();
+		}
+	}
+
+	static public class SheetToRowConsumer implements XSSFSheetXMLHandler.SheetContentsHandler {
+		private int currentRow = -1;
+		private int currentCol = -1;
+
+		SimpleRow row = new SimpleRow();
+		Consumer<SimpleRow> rowConsumer;
+
+		public SheetToRowConsumer(Consumer<SimpleRow> rowConsumer) {
+			this.rowConsumer = rowConsumer;
+		}
+
+		@Override
+		public void startRow(int rowNum) {
+			row.resetValues();
+			currentCol = -1;
+
+			// If there were gaps, output the missing rows
+			for (++currentRow; currentRow < rowNum; currentRow++) {
+				row.setRowNumber(currentRow);
+				rowConsumer.accept(row);
+			}
+			row.setRowNumber(currentRow);
+		}
+
+		@Override
+		public void endRow(int rowNum) {
+			rowConsumer.accept(row);
+		}
+
+		@Override
+		public void cell(String cellReference, String formattedValue, XSSFComment comment) {
+
+			// gracefully handle missing CellRef here in a similar way as XSSFCell does
+			if (cellReference == null) {
+				cellReference = new CellAddress(currentRow, currentCol).formatAsString();
+			}
+
+			// Did we miss any cells?
+			int thisCol = (new CellReference(cellReference)).getCol();
+			int missedCols = thisCol - currentCol - 1;
+			for (int i = 0; i < missedCols; i++) {
+				row.getValues().add(null);
+			}
+			currentCol = thisCol;
+
+			row.getValues().add(formattedValue);
+		}
+
+		@Override
+		public void endSheet() {
+			// signal end of sheet
+			rowConsumer.accept(null);
+		}
+	}
+}
